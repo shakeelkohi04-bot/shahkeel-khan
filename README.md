@@ -8,6 +8,7 @@ An AI-powered web app built with **Streamlit** and **Google Gemini**. Upload a c
 - Exactly **20 MCQs** (question, options A–D, correct answer, short explanation)
 - Exactly **5 short questions** with simple model answers
 - Exactly **3 long questions** with complete answers, headings and key points
+- **Automatic model selection**: the app asks Google which Gemini models your API key can use and lists only those that support content generation (with a Refresh button)
 - **Easy / Normal / Difficult** levels
 - **English and Urdu** output (right-to-left display for Urdu)
 - Tabs for MCQs, Short and Long questions; Show/Hide answer sections; "Show all answers" switch
@@ -57,7 +58,7 @@ README.md         # this guide
    pip install -r requirements.txt
    ```
 
-5. Give the app your API key. Choose **one** option:
+5. Give the app your API key. The model dropdown in the sidebar fills itself once a valid key is present. Choose **one** option:
 
    - **Option A (easiest):** run the app and paste the key in the sidebar box.
    - **Option B (saved on your PC):** create a folder `.streamlit` and inside it a file `secrets.toml` containing:
@@ -124,9 +125,11 @@ To update the app later, change the files on GitHub (or `git push` again) and St
 | "No text could be found" | The PDF is a scan (images). Use a text-based PDF, DOCX or TXT. |
 | Urdu text looks broken after PDF upload | Some Urdu PDFs store text in a way that cannot be extracted properly. Use the DOCX or TXT version. |
 | "API key was rejected" | Re-copy the key from Google AI Studio; make sure there are no spaces. |
-| "Usage limit was reached" | Wait a minute, or choose `gemini-2.5-flash-lite` in the sidebar. |
-| "Model is not available" | Google renames models over time. Pick another model in the sidebar, or edit `MODEL_OPTIONS` at the top of `app.py`. |
+| "Usage limit was reached" | Wait a minute, or choose a "flash-lite" model in the sidebar. |
+| "Model is not available for your API key" | Pick another model in the sidebar. The list comes live from Google for your key, so it never contains models you cannot use. Click **Refresh models** if the list looks old. |
+| "No Gemini models that support content generation" | Create a new key at <https://aistudio.google.com/apikey> and check that it belongs to a project with the Gemini API enabled. |
+| Model list will not load | Check the key and your internet connection, then click **Refresh models**. |
 
 ## Important
 
-AI can make mistakes. Always read the questions and answers before using them in a real exam or class.# shahkeel-khan
+AI can make mistakes. Always read the questions and answers before using them in a real exam or class.
