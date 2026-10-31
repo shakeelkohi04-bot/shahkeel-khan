@@ -34,7 +34,6 @@ MIN_CHARS = 300            # below this the chapter is considered too short/empt
 MAX_CHARS = 150_000        # chapter text sent to the AI is capped at this size
 MAX_ATTEMPTS = 3           # tries per section if the AI returns a bad answer
 
-MODEL_OPTIONS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
 DIFFICULTY_OPTIONS = ["Easy", "Normal", "Difficult"]
 LANGUAGE_OPTIONS = ["English", "Urdu"]
 
@@ -388,7 +387,7 @@ def get_client(api_key):
     return genai.Client(api_key=api_key)
 
 
-def friendly_api_error(exc):
+def friendly_api_error(exc, listing=False):
     """Convert an API/network exception into a safe, readable message."""
     low = str(exc).lower()
     code = getattr(exc, "code", None)
@@ -398,10 +397,13 @@ def friendly_api_error(exc):
                 "active and allowed to use the selected model.")
     if code == 429 or "quota" in low or "resource_exhausted" in low or ("rate" in low and "limit" in low):
         return ("The Gemini usage limit was reached. Wait a minute and try "
-                "again, or choose a lighter model such as gemini-2.5-flash-lite.")
+                "again, or choose a lighter \"flash-lite\" model in the sidebar.")
     if code == 404 or "not found" in low:
-        return ("The selected model is not available for this key. Choose "
-                "another model in the sidebar.")
+        if listing:
+            return "Could not load the model list from Google. Please try again."
+        return ("This model is not available for your API key. Pick a "
+                "different model in the sidebar (use Refresh models if the "
+                "list looks old) and try again.")
     if code in (500, 502, 503, 504) or "unavailable" in low or "overloaded" in low:
         return "Gemini is busy right now. Please try again in a moment."
     if any(w in low for w in ("connect", "timeout", "timed out", "getaddrinfo",
@@ -411,6 +413,75 @@ def friendly_api_error(exc):
         return ("Gemini rejected the request (the chapter may be too large or "
                 "contain unsupported content).")
     return f"Unexpected AI error ({type(exc).__name__}). Please try again."
+
+
+# Name parts of models that cannot be used for text/JSON question generation.
+_EXCLUDED_MODEL_PARTS = (
+    "embed", "imagen", "veo", "tts", "image", "live", "audio", "aqa",
+    "robotics", "computer-use", "vision", "dialog", "learnlm",
+)
+
+
+def _supports_generation(model):
+    """True if the model advertises support for generateContent."""
+    actions = getattr(model, "supported_actions", None)
+    if actions is None:
+        actions = getattr(model, "supported_generation_methods", None)
+    if actions is None:
+        return True  # field missing in this SDK version; filtered by name below
+    return any(str(a).lower() == "generatecontent" for a in actions)
+
+
+def _model_rank(model_id):
+    """Sort key: best default first (stable Flash, then Flash-Lite, then Pro)."""
+    low = model_id.lower()
+    version = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
+    version = float(version.group(1)) if version else 0.0
+    if "flash" in low and "lite" not in low:
+        family = 0
+    elif "flash" in low:
+        family = 1
+    elif "pro" in low:
+        family = 2
+    else:
+        family = 3
+    unstable = any(w in low for w in ("preview", "exp", "thinking"))
+    return (family, unstable, -version, low)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def list_available_models(api_key):
+    """Ask Google which models this API key can use for generate_content().
+
+    Returns a list of (model_id, display_name), best default first.
+    Errors are raised as GenerationError with a safe message.
+    """
+    try:
+        client = get_client(api_key)
+        found = {}
+        for model in client.models.list():
+            name = str(getattr(model, "name", "") or "")
+            model_id = name.split("/", 1)[-1]
+            low = model_id.lower()
+            if not model_id.startswith("gemini"):
+                continue
+            if any(part in low for part in _EXCLUDED_MODEL_PARTS):
+                continue
+            if not _supports_generation(model):
+                continue
+            display = str(getattr(model, "display_name", "") or model_id)
+            found[model_id] = display
+    except Exception as exc:
+        raise GenerationError(friendly_api_error(exc, listing=True))
+
+    if not found:
+        raise GenerationError(
+            "Your API key is valid, but Google returned no Gemini models that "
+            "support content generation. Create a new key in Google AI Studio "
+            "and make sure the Gemini API is enabled for it."
+        )
+    ordered = sorted(found, key=_model_rank)
+    return [(model_id, found[model_id]) for model_id in ordered]
 
 
 def is_temporary(exc):
@@ -433,7 +504,6 @@ def generate_section(client, model, kind, chapter, difficulty, language, avoid):
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
-                    temperature=0.4,
                     response_mime_type="application/json",
                     max_output_tokens=spec["tokens"],
                 ),
@@ -603,7 +673,26 @@ def main():
                      "in this session and is never saved.",
             ).strip()
             st.caption("Get a free key at aistudio.google.com/apikey")
-        model = st.selectbox("Gemini model", MODEL_OPTIONS, index=0)
+
+        model = None
+        if api_key:
+            try:
+                available = list_available_models(api_key)
+                model = st.selectbox(
+                    "Gemini model",
+                    [model_id for model_id, _ in available],
+                    index=0,
+                    format_func=lambda m: dict(available).get(m, m) + f"  ({m})",
+                    help="Only models that your API key can use for "
+                         "content generation are listed.",
+                )
+            except GenerationError as error:
+                st.error(f"❌ {error}")
+            if st.button("🔄 Refresh models", use_container_width=True):
+                list_available_models.clear()
+                st.rerun()
+        else:
+            st.selectbox("Gemini model", ["Enter your API key first"], disabled=True)
         st.divider()
         st.caption(
             "Questions are generated only from the uploaded chapter. Always "
@@ -686,6 +775,8 @@ def main():
     if generate:
         if not api_key:
             st.error("❌ Please enter your Gemini API key in the sidebar.")
+        elif not model:
+            st.error("❌ No usable Gemini model is selected. Check the sidebar.")
         else:
             progress = st.progress(0.0)
             status = st.empty()
