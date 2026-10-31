@@ -9,6 +9,9 @@ An AI-powered web app built with **Streamlit** and **Google Gemini**. Upload a c
 - Exactly **5 short questions** with simple model answers
 - Exactly **3 long questions** with complete answers, headings and key points
 - **Automatic model selection**: the app asks Google which Gemini models your API key can use and lists only those that support content generation (with a Refresh button)
+- **Automatic retries**: temporary errors (HTTP 429 rate limit, 500, 502, 503, 504, network problems) are retried up to 4 times with exponential backoff (about 3, 6, 12 and 24 seconds), with a live countdown on screen
+- **Honest error messages**: the app shows the real error category (for example *Google server overloaded (HTTP 503)* or *API quota exceeded (HTTP 429)*) and a "Technical details" box; your API key is never shown
+- **Fewer API requests**: clicking Generate again with the same file and settings reuses your existing questions, and if one section fails the sections that already worked are kept and not requested again
 - **Easy / Normal / Difficult** levels
 - **English and Urdu** output (right-to-left display for Urdu)
 - Tabs for MCQs, Short and Long questions; Show/Hide answer sections; "Show all answers" switch
@@ -125,7 +128,13 @@ To update the app later, change the files on GitHub (or `git push` again) and St
 | "No text could be found" | The PDF is a scan (images). Use a text-based PDF, DOCX or TXT. |
 | Urdu text looks broken after PDF upload | Some Urdu PDFs store text in a way that cannot be extracted properly. Use the DOCX or TXT version. |
 | "API key was rejected" | Re-copy the key from Google AI Studio; make sure there are no spaces. |
-| "Usage limit was reached" | Wait a minute, or choose a "flash-lite" model in the sidebar. |
+| "Google server overloaded / unavailable (HTTP 503)" | Google's servers are busy. This is temporary and not your fault. The app already retried 4 times. Wait a few minutes, or choose another model in the sidebar. |
+| "Google server error (HTTP 500/502/504)" | Temporary problem on Google's side. Try again shortly. |
+| "Rate limit reached (HTTP 429)" | Too many requests or tokens per minute. The app waits and retries automatically; if it still fails, wait a minute. Shorter chapters use fewer tokens. |
+| "API quota exceeded (HTTP 429)" | Your daily or plan quota is used up. Retrying will not help. Wait for the quota to reset (free-tier daily limits usually reset at midnight Pacific time), check your usage and limits in Google AI Studio, enable billing, or choose a model with its own quota. |
+| "Invalid or unauthorised API key" | Re-copy the key from Google AI Studio; make sure there are no spaces and the key is active. |
+| "Connection problem" | Check your internet connection and try again. |
+| "Invalid AI response" | Gemini answered in an unusable format. Click Generate again; sections that already worked are kept. |
 | "Model is not available for your API key" | Pick another model in the sidebar. The list comes live from Google for your key, so it never contains models you cannot use. Click **Refresh models** if the list looks old. |
 | "No Gemini models that support content generation" | Create a new key at <https://aistudio.google.com/apikey> and check that it belongs to a project with the Gemini API enabled. |
 | Model list will not load | Check the key and your internet connection, then click **Refresh models**. |
