@@ -7,11 +7,14 @@ Upload a chapter (PDF, DOCX or TXT) and get 20 MCQs, 5 short questions and
 Run locally:   streamlit run app.py
 """
 
+import hashlib
 import io
 import json
 import os
+import random
 import re
 import time
+from collections import namedtuple
 from datetime import datetime
 
 import streamlit as st
@@ -32,7 +35,11 @@ NUM_LONG = 3
 MAX_FILE_MB = 15
 MIN_CHARS = 300            # below this the chapter is considered too short/empty
 MAX_CHARS = 150_000        # chapter text sent to the AI is capped at this size
-MAX_ATTEMPTS = 3           # tries per section if the AI returns a bad answer
+MAX_API_RETRIES = 4        # retries after a temporary API error (429/5xx/network)
+RETRY_BASE_SECONDS = 3     # first wait; doubles each retry: 3, 6, 12, 24 s
+RETRY_MAX_SECONDS = 60     # longest single wait between retries
+RETRY_AFTER_LIMIT = 90     # if Google asks for a longer wait, do not retry
+MAX_VALIDATION_ATTEMPTS = 2  # tries per section if the AI reply is malformed
 
 DIFFICULTY_OPTIONS = ["Easy", "Normal", "Difficult"]
 LANGUAGE_OPTIONS = ["English", "Urdu"]
@@ -67,7 +74,17 @@ class ChapterError(Exception):
 
 
 class GenerationError(Exception):
-    """Raised when question generation fails (message is user-friendly)."""
+    """Raised when question generation fails.
+
+    message: plain explanation, label: short error category,
+    detail: sanitized technical text (API key removed).
+    """
+
+    def __init__(self, message, label="Error", detail=""):
+        super().__init__(message)
+        self.message = message
+        self.label = label
+        self.detail = detail
 
 
 # --------------------------------------------------------------------------
@@ -387,32 +404,173 @@ def get_client(api_key):
     return genai.Client(api_key=api_key)
 
 
-def friendly_api_error(exc, listing=False):
-    """Convert an API/network exception into a safe, readable message."""
-    low = str(exc).lower()
-    code = getattr(exc, "code", None)
+ErrorInfo = namedtuple(
+    "ErrorInfo", "category label retryable message retry_after code detail"
+)
 
-    if code in (401, 403) or "api key" in low or "api_key" in low or "permission" in low:
-        return ("The Gemini API key was rejected. Check that the key is correct, "
-                "active and allowed to use the selected model.")
-    if code == 429 or "quota" in low or "resource_exhausted" in low or ("rate" in low and "limit" in low):
-        return ("The Gemini usage limit was reached. Wait a minute and try "
-                "again, or choose a lighter \"flash-lite\" model in the sidebar.")
-    if code == 404 or "not found" in low:
-        if listing:
-            return "Could not load the model list from Google. Please try again."
-        return ("This model is not available for your API key. Pick a "
-                "different model in the sidebar (use Refresh models if the "
-                "list looks old) and try again.")
-    if code in (500, 502, 503, 504) or "unavailable" in low or "overloaded" in low:
-        return "Gemini is busy right now. Please try again in a moment."
-    if any(w in low for w in ("connect", "timeout", "timed out", "getaddrinfo",
-                              "name resolution", "network", "ssl")):
-        return "Could not reach Gemini. Check your internet connection and try again."
-    if code == 400:
-        return ("Gemini rejected the request (the chapter may be too large or "
-                "contain unsupported content).")
-    return f"Unexpected AI error ({type(exc).__name__}). Please try again."
+
+def _safe_detail(exc):
+    """Technical error text for display, with any API key removed."""
+    text = f"{type(exc).__name__}: {exc}"
+    text = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[API-KEY-HIDDEN]", text)
+    return re.sub(r"\s+", " ", text)[:600]
+
+
+def _status_code(exc):
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    match = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _retry_delay(low):
+    """Read the wait time Google suggests in a 429 message (seconds)."""
+    for pattern in (r"retry in ([\d.]+)\s*s", r"retrydelay['\"]?\s*[:=]\s*['\"]?([\d.]+)s"):
+        match = re.search(pattern, low)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+    return None
+
+
+def classify_error(exc):
+    """Sort an exception into a clear category and say if a retry can help."""
+    low = str(exc).lower()
+    status = str(getattr(exc, "status", "") or "").lower()
+    code = _status_code(exc)
+    detail = _safe_detail(exc)
+    retry_after = _retry_delay(low)
+    suffix = f" (HTTP {code})" if code else ""
+
+    def make(category, label, retryable, message):
+        return ErrorInfo(category, label + suffix, retryable, message,
+                         retry_after, code, detail)
+
+    # 1. Invalid / unauthorised API key
+    if (code in (401, 403) or "api key not valid" in low
+            or "api_key_invalid" in low or "api key expired" in low
+            or status in ("unauthenticated", "permission_denied")):
+        return make(
+            "invalid_key", "Invalid or unauthorised API key", False,
+            "Google rejected your API key. Check that it is copied correctly "
+            "(no spaces), is still active, and is allowed to use the Gemini API.")
+
+    # 2. Model not available for this key
+    if (code == 404 or status == "not_found"
+            or ("models/" in low and "not found" in low)
+            or "is not supported for generatecontent" in low):
+        return make(
+            "model_unavailable", "Model not available", False,
+            "The selected model is not available for your API key. Choose a "
+            "different model in the sidebar, or click Refresh models.")
+
+    # 3. Quota / rate limit (HTTP 429)
+    if (code == 429 or status == "resource_exhausted"
+            or "resource_exhausted" in low
+            or ("quota" in low and "exceed" in low)):
+        daily = any(w in low for w in
+                    ("perday", "per day", "daily", "limit: 0", "requests_per_day"))
+        if daily or (retry_after and retry_after > RETRY_AFTER_LIMIT):
+            return make(
+                "quota_exceeded", "API quota exceeded", False,
+                "Your Gemini API quota is used up (daily or plan limit), so "
+                "retrying now will not help. Wait for the quota to reset "
+                "(free-tier daily quotas usually reset at midnight Pacific "
+                "time), check your usage and limits in Google AI Studio "
+                "(aistudio.google.com) or at ai.google.dev/gemini-api/docs/rate-limits, "
+                "enable billing, or pick another model that has its own quota.")
+        return make(
+            "rate_limited", "Rate limit reached (too many requests)", True,
+            "You sent too many requests or tokens in a short time (per-minute "
+            "limit). This is temporary and normally clears after a short wait.")
+
+    # 4. Google server problems
+    if (code in (500, 502, 503, 504)
+            or status in ("unavailable", "internal", "deadline_exceeded")
+            or "overloaded" in low or "unavailable" in low):
+        if code == 503 or status == "unavailable" or "overloaded" in low or "unavailable" in low:
+            return make(
+                "server_overloaded", "Google server overloaded / unavailable", True,
+                "Google's servers for this model are overloaded (high demand). "
+                "This is temporary and is not caused by your key or your quota.")
+        return make(
+            "server_error", "Google server error", True,
+            "Google's servers returned an internal error. This is usually "
+            "temporary.")
+
+    # 5. Network problems
+    name = type(exc).__name__.lower()
+    if (any(w in name for w in ("connect", "timeout", "network", "remoteprotocol", "readerror"))
+            or any(w in low for w in ("getaddrinfo", "name resolution", "timed out",
+                                      "connection", "ssl", "network is unreachable"))):
+        return make(
+            "connection", "Connection problem", True,
+            "The app could not reach Google. Check your internet connection "
+            "(or the hosting server's connection).")
+
+    # 6. Bad request
+    if code == 400 or status == "invalid_argument":
+        return make(
+            "bad_request", "Request rejected by Gemini", False,
+            "Gemini refused the request. The chapter may be too large or "
+            "contain unsupported content, or the selected model may not "
+            "support this request. Try a shorter chapter or another model.")
+
+    return make("unknown", "Unexpected error", False,
+                "An unexpected error occurred. See the technical details below.")
+
+
+def to_generation_error(info, attempts=0):
+    message = info.message
+    if info.retryable and attempts > 1:
+        message += (f" The app tried {attempts} times with increasing waits "
+                    "and then stopped. Please try again in a few minutes, or "
+                    "choose a different model.")
+    return GenerationError(message, label=info.label, detail=info.detail)
+
+
+def backoff_delay(retry_number, retry_after=None):
+    """Exponential backoff with a little random jitter: ~3, 6, 12, 24 s."""
+    delay = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * 2 ** (retry_number - 1))
+    delay += random.uniform(0, 1)
+    if retry_after:  # Google told us how long to wait
+        delay = max(delay, min(retry_after + 1, RETRY_AFTER_LIMIT))
+    return delay
+
+
+def wait_with_countdown(delay, info, retry_number, max_retries, notify):
+    end = time.monotonic() + delay
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        if notify:
+            notify(
+                f"⏳ {info.label}. Retry {retry_number} of {max_retries} "
+                f"in {int(remaining) + 1} s... (waiting automatically)"
+            )
+        time.sleep(min(1.0, remaining))
+
+
+def call_with_retry(action, notify=None, max_retries=MAX_API_RETRIES):
+    """Run action(); retry temporary errors with exponential backoff."""
+    retries_used = 0
+    while True:
+        try:
+            return action()
+        except GenerationError:
+            raise
+        except Exception as exc:
+            info = classify_error(exc)
+            if not info.retryable or retries_used >= max_retries:
+                raise to_generation_error(info, attempts=retries_used + 1)
+            retries_used += 1
+            delay = backoff_delay(retries_used, info.retry_after)
+            wait_with_countdown(delay, info, retries_used, max_retries, notify)
 
 
 # Name parts of models that cannot be used for text/JSON question generation.
@@ -459,7 +617,8 @@ def list_available_models(api_key):
     try:
         client = get_client(api_key)
         found = {}
-        for model in client.models.list():
+        models = call_with_retry(lambda: list(client.models.list()), max_retries=1)
+        for model in models:
             name = str(getattr(model, "name", "") or "")
             model_id = name.split("/", 1)[-1]
             low = model_id.lower()
@@ -471,8 +630,10 @@ def list_available_models(api_key):
                 continue
             display = str(getattr(model, "display_name", "") or model_id)
             found[model_id] = display
+    except GenerationError:
+        raise
     except Exception as exc:
-        raise GenerationError(friendly_api_error(exc, listing=True))
+        raise to_generation_error(classify_error(exc))
 
     if not found:
         raise GenerationError(
@@ -484,22 +645,38 @@ def list_available_models(api_key):
     return [(model_id, found[model_id]) for model_id in ordered]
 
 
-def is_temporary(exc):
-    code = getattr(exc, "code", None)
-    low = str(exc).lower()
-    return code in (500, 502, 503, 504) or "unavailable" in low or "overloaded" in low
+def _reply_text(response):
+    try:
+        return response.text
+    except Exception:
+        return None
 
 
-def generate_section(client, model, kind, chapter, difficulty, language, avoid):
-    """Generate one section, retrying when the reply is invalid."""
+def _was_cut_off(response):
+    try:
+        reason = response.candidates[0].finish_reason
+        return "max_tokens" in str(reason).lower()
+    except Exception:
+        return False
+
+
+def generate_section(client, model, kind, chapter, difficulty, language,
+                     avoid, notify=None):
+    """Generate one section.
+
+    Temporary API errors are retried with backoff (call_with_retry).
+    A malformed AI reply is retried separately, at most
+    MAX_VALIDATION_ATTEMPTS times in total.
+    """
     spec = SECTIONS[kind]
     feedback = ""
     last_problem = "unknown problem"
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for _ in range(MAX_VALIDATION_ATTEMPTS):
         prompt = build_prompt(kind, chapter, difficulty, language, avoid, feedback)
-        try:
-            response = client.models.generate_content(
+
+        def action(prompt=prompt):
+            return client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -508,29 +685,35 @@ def generate_section(client, model, kind, chapter, difficulty, language, avoid):
                     max_output_tokens=spec["tokens"],
                 ),
             )
-            reply = response.text
-        except Exception as exc:  # network, quota, key, model errors
-            if is_temporary(exc) and attempt < MAX_ATTEMPTS:
-                time.sleep(2 * attempt)
-                continue
-            raise GenerationError(friendly_api_error(exc))
 
+        response = call_with_retry(action, notify)
         try:
-            return validate_section(kind, parse_json(reply))
+            return validate_section(kind, parse_json(_reply_text(response)))
         except ValueError as problem:
             last_problem = str(problem)
             feedback = last_problem
+            if _was_cut_off(response):
+                feedback += " (the reply was cut off, so keep answers shorter)"
+                last_problem = feedback
 
     raise GenerationError(
-        f"The AI could not produce a valid set of {spec['label']} "
-        f"({last_problem}). Please try again."
+        f"Gemini answered, but the {spec['label']} could not be used "
+        f"({last_problem}). Click Generate again; sections that already "
+        "worked are kept and will not be requested again.",
+        label="Invalid AI response",
+        detail=last_problem,
     )
 
 
-def generate_all(api_key, model, chapter, difficulty, language, on_progress):
-    """Generate MCQs, short and long questions and return them together."""
+def generate_all(api_key, model, chapter, difficulty, language,
+                 on_progress, on_retry=None, done=None):
+    """Generate MCQs, short and long questions.
+
+    `done` holds sections that already succeeded (kept between attempts), so
+    a failed run only asks Gemini for the sections that are still missing.
+    """
     client = get_client(api_key)
-    results = {}
+    done = {} if done is None else done
     avoid = []
 
     steps = [
@@ -539,18 +722,29 @@ def generate_all(api_key, model, chapter, difficulty, language, on_progress):
         ("long", f"Generating {NUM_LONG} long questions..."),
     ]
     for index, (kind, message) in enumerate(steps):
-        on_progress(index / len(steps), message)
-        results[kind] = generate_section(
-            client, model, kind, chapter, difficulty, language, avoid
-        )
-        avoid.extend(item["question"] for item in results[kind])
+        if kind not in done:
+            on_progress(index / len(steps), message)
+            done[kind] = generate_section(
+                client, model, kind, chapter, difficulty, language,
+                avoid, on_retry,
+            )
+        avoid.extend(item["question"] for item in done[kind])
     on_progress(1.0, "Done!")
 
-    # Final safety check of the required counts.
-    assert len(results["mcq"]) == NUM_MCQ
-    assert len(results["short"]) == NUM_SHORT
-    assert len(results["long"]) == NUM_LONG
+    results = {kind: done[kind] for kind, _ in steps}
+    if (len(results["mcq"]), len(results["short"]), len(results["long"])) != (
+            NUM_MCQ, NUM_SHORT, NUM_LONG):
+        raise GenerationError(
+            "The generated set did not have the required number of questions.",
+            label="Invalid AI response",
+        )
     return results
+
+
+def make_signature(model, difficulty, language, chapter):
+    """Fingerprint of everything that decides the output (for reuse/resume)."""
+    head = f"{model}|{difficulty}|{language}|".encode("utf-8")
+    return hashlib.sha256(head + chapter.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -635,6 +829,14 @@ def get_secret_key():
     return key or os.environ.get("GEMINI_API_KEY", "")
 
 
+def show_generation_error(error):
+    """Show the real error category, an explanation and technical details."""
+    st.error(f"❌ **{error.label}**\n\n{error.message}")
+    if error.detail:
+        with st.expander("Technical details"):
+            st.code(error.detail, language=None)
+
+
 def render_mcqs(mcqs, show_all):
     for number, mcq in enumerate(mcqs, 1):
         with st.container(border=True):
@@ -687,7 +889,7 @@ def main():
                          "content generation are listed.",
                 )
             except GenerationError as error:
-                st.error(f"❌ {error}")
+                show_generation_error(error)
             if st.button("🔄 Refresh models", use_container_width=True):
                 list_available_models.clear()
                 st.rerun()
@@ -767,6 +969,13 @@ def main():
             )
 
     # ---- Generate ----------------------------------------------------------
+    regenerate = st.checkbox(
+        "Regenerate even if nothing has changed",
+        value=False,
+        help="Normally, clicking Generate again with the same file and "
+             "settings reuses the questions you already have, so no extra "
+             "request is sent to Gemini.",
+    )
     generate = st.button(
         "✨ Generate Questions", type="primary", use_container_width=True,
         disabled=chapter_text is None,
@@ -778,36 +987,65 @@ def main():
         elif not model:
             st.error("❌ No usable Gemini model is selected. Check the sidebar.")
         else:
-            progress = st.progress(0.0)
-            status = st.empty()
+            chapter_used = chapter_text[:MAX_CHARS]
+            signature = make_signature(model, difficulty, language, chapter_used)
 
-            def on_progress(fraction, message):
-                progress.progress(fraction)
-                status.info(message)
+            if (not regenerate and st.session_state.get("results")
+                    and st.session_state.get("results_sig") == signature):
+                st.info(
+                    "ℹ️ These questions were already generated with the same "
+                    "file and settings, so no new request was sent to Gemini. "
+                    "Change a setting or tick “Regenerate even if nothing has "
+                    "changed” to get a new set."
+                )
+            else:
+                partial = st.session_state.get("partial")
+                if not partial or partial.get("sig") != signature:
+                    partial = {"sig": signature, "sections": {}}
+                    st.session_state["partial"] = partial
 
-            try:
-                with st.spinner("The AI is reading your chapter..."):
-                    results = generate_all(
-                        api_key, model, chapter_text[:MAX_CHARS],
-                        difficulty, language, on_progress,
-                    )
-                st.session_state["results"] = results
-                st.session_state["meta"] = {
-                    "chapter": uploaded.name,
-                    "difficulty": difficulty,
-                    "language": language,
-                }
-                status.empty()
-                progress.empty()
-            except GenerationError as error:
-                progress.empty()
-                status.empty()
-                st.error(f"❌ {error}")
-            except Exception as error:
-                progress.empty()
-                status.empty()
-                st.error(f"❌ Something went wrong ({type(error).__name__}). "
-                         "Please try again.")
+                progress = st.progress(0.0)
+                status = st.empty()
+
+                def on_progress(fraction, message):
+                    progress.progress(fraction)
+                    status.info(message)
+
+                def on_retry(message):
+                    status.warning(message)
+
+                try:
+                    with st.spinner("The AI is reading your chapter..."):
+                        results = generate_all(
+                            api_key, model, chapter_used, difficulty,
+                            language, on_progress, on_retry,
+                            partial["sections"],
+                        )
+                    st.session_state["results"] = results
+                    st.session_state["results_sig"] = signature
+                    st.session_state["meta"] = {
+                        "chapter": uploaded.name,
+                        "difficulty": difficulty,
+                        "language": language,
+                    }
+                    st.session_state.pop("partial", None)
+                    status.empty()
+                    progress.empty()
+                except GenerationError as error:
+                    progress.empty()
+                    status.empty()
+                    show_generation_error(error)
+                    if partial["sections"]:
+                        st.info(
+                            f"ℹ️ {len(partial['sections'])} of 3 sections were "
+                            "already created and are saved. Click Generate "
+                            "again to continue without repeating them."
+                        )
+                except Exception as error:
+                    progress.empty()
+                    status.empty()
+                    info = classify_error(error)
+                    show_generation_error(to_generation_error(info))
 
     # ---- Results -----------------------------------------------------------
     results = st.session_state.get("results")
